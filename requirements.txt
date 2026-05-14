@@ -1,0 +1,7 @@
+streamlit
+openai
+pypandoc
+python-docx
+mammoth
+markdownify
+markdown2
