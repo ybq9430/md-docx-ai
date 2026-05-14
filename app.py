@@ -1,6 +1,7 @@
 """
 MD/Docx 智能互转排版系统 - 主入口
 基于 Streamlit 的 Web 界面，提供 Markdown 与 docx 双向转换及 AI 智能排版功能
+支持：MD→Docx、Docx→MD、上传 DOCX 自动 AI 排版输出 DOCX
 """
 
 import os
@@ -38,16 +39,41 @@ def _check_pandoc_available() -> bool:
 
 
 def _read_uploaded_file(uploaded_file) -> str:
-    """读取上传文件内容，返回文本字符串"""
+    """读取上传的 .md 文件内容，返回文本字符串"""
     if uploaded_file is None:
         return ""
     try:
         content = uploaded_file.read().decode("utf-8")
-        uploaded_file.seek(0)  # 重置文件指针
+        uploaded_file.seek(0)
         return content
     except UnicodeDecodeError:
-        # docx 是二进制格式，不能直接 decode
         return ""
+
+
+def _read_docx_as_text(uploaded_file) -> str:
+    """
+    读取上传的 .docx 文件，提取纯文本内容。
+    优先使用 Pandoc，回退 mammoth。
+    """
+    file_bytes = uploaded_file.read()
+    uploaded_file.seek(0)
+
+    try:
+        import pypandoc
+        pypandoc.get_pandoc_version()
+        result = pypandoc.convert_text(file_bytes, "markdown", format="docx", extra_args=["--wrap=none"])
+        return result.strip()
+    except Exception:
+        pass
+
+    try:
+        import mammoth
+        from markdownify import markdownify as md
+        html = mammoth.convert_to_html(file_bytes).value
+        result = md(html, heading_style="ATX")
+        return result.strip()
+    except Exception:
+        raise RuntimeError("无法读取 docx 文件内容，请确认文件有效且 Pandoc 已安装")
 
 
 def _render_markdown_preview(md_text: str):
@@ -93,10 +119,9 @@ with st.sidebar:
         help="您的 Key 仅保存在当前会话中，刷新页面后清空，不会记录到日志或磁盘。",
         label_visibility="collapsed",
     )
-    # 自动同步到 session
     if api_key_input != st.session_state.api_key:
         st.session_state.api_key = api_key_input
-        st.session_state.api_verified = False  # Key 变更后需重新验证
+        st.session_state.api_verified = False
 
     col1, col2 = st.columns([1, 1])
     with col1:
@@ -149,152 +174,255 @@ with st.sidebar:
 st.title("📄 MD↔Docx 智能互转排版系统")
 st.caption("上传文件或粘贴内容，一键转换格式，AI 辅助排版优化")
 
-# ---- 输入区域 ----
-col_upload, col_text = st.columns([1, 1])
+# ---- 模式选择 ----
+st.subheader("📌 选择工作模式")
+tab_md_docx, tab_docx_auto = st.tabs([
+    "🔄 MD ↔ Docx 互转",
+    "🤖 DOCX 自动 AI 排版",
+])
 
-with col_upload:
-    st.subheader("📁 文件上传")
-    uploaded_file = st.file_uploader(
-        f"支持 .md / .docx（最大 {MAX_FILE_SIZE_MB}MB）",
-        type=SUPPORTED_EXTENSIONS,
-        help="上传 .md 或 .docx 文件",
-        label_visibility="collapsed",
+# ==================== Tab 1: MD ↔ Docx 互转 ====================
+with tab_md_docx:
+    col_upload, col_text = st.columns([1, 1])
+
+    with col_upload:
+        st.subheader("📁 文件上传")
+        uploaded_file_1 = st.file_uploader(
+            f"支持 .md / .docx（最大 {MAX_FILE_SIZE_MB}MB）",
+            type=SUPPORTED_EXTENSIONS,
+            help="上传 .md 或 .docx 文件",
+            label_visibility="collapsed",
+            key="upload_1",
+        )
+
+    with col_text:
+        st.subheader("📝 文本粘贴")
+        text_input_1 = st.text_area(
+            "粘贴 Markdown 文本（文件上传优先）",
+            height=200,
+            placeholder="在此粘贴 Markdown 内容...\n文件上传后将以文件内容为准",
+            label_visibility="collapsed",
+            key="text_1",
+        )
+
+    st.divider()
+    col_dir, col_ai, col_btn = st.columns([1, 1, 1])
+
+    with col_dir:
+        direction = st.radio(
+            "🔄 转换方向",
+            options=["md_to_docx", "docx_to_md"],
+            format_func=lambda x: "MD → Docx" if x == "md_to_docx" else "Docx → MD",
+            horizontal=True,
+            key="direction_1",
+        )
+
+    with col_ai:
+        use_ai_1 = st.checkbox(
+            "🤖 AI 优化排版",
+            value=False,
+            help="勾选后将调用 DeepSeek API 对内容进行智能排版优化",
+            disabled=not st.session_state.api_key.strip(),
+            key="ai_1",
+        )
+        if not st.session_state.api_key.strip():
+            st.caption("⚠️ 请先填写 API Key 以启用 AI 排版")
+
+    with col_btn:
+        st.write("")
+        convert_clicked_1 = st.button(
+            "🚀 开始转换",
+            type="primary",
+            use_container_width=True,
+            key="btn_1",
+        )
+
+    st.divider()
+
+    # ---- 转换逻辑 ----
+    if convert_clicked_1:
+        content = None
+
+        if uploaded_file_1 is not None:
+            file_size_mb = uploaded_file_1.size / (1024 * 1024)
+            if file_size_mb > MAX_FILE_SIZE_MB:
+                st.error(f"文件大小 {file_size_mb:.1f}MB 超过上限 {MAX_FILE_SIZE_MB}MB，请压缩后重试")
+                st.stop()
+
+            file_ext = uploaded_file_1.name.rsplit(".", 1)[-1].lower() if "." in uploaded_file_1.name else ""
+
+            if file_ext == "md":
+                content = _read_uploaded_file(uploaded_file_1)
+                if not content.strip():
+                    st.error("上传的 Markdown 文件内容为空")
+                    st.stop()
+            elif file_ext == "docx":
+                content = uploaded_file_1
+            else:
+                st.error(f"不支持的文件格式：.{file_ext}，仅支持 {', '.join(SUPPORTED_EXTENSIONS)}")
+                st.stop()
+        elif text_input_1.strip():
+            content = text_input_1.strip()
+        else:
+            st.error("请上传文件或粘贴文本内容")
+            st.stop()
+
+        with st.spinner("正在处理..."):
+            final_md = ""
+            final_docx = None
+            final_type = ""
+
+            try:
+                if direction == "md_to_docx":
+                    if not isinstance(content, str):
+                        st.error("MD → Docx 需要 Markdown 文本输入，请上传 .md 文件或粘贴内容")
+                        st.stop()
+
+                    working_md = content
+
+                    if use_ai_1:
+                        with st.spinner("AI 正在优化排版..."):
+                            try:
+                                working_md = format_with_ai(
+                                    working_md, style, st.session_state.api_key
+                                )
+                                st.success("✅ AI 排版完成")
+                            except Exception as ai_err:
+                                st.warning(f"⚠️ AI 排版失败，将使用原始内容继续：{str(ai_err)[:200]}")
+
+                    final_docx = convert_md_to_docx(
+                        working_md, _get_template_path()
+                    )
+                    final_md = working_md
+                    final_type = "docx"
+
+                else:  # docx_to_md
+                    if isinstance(content, str):
+                        st.error("Docx → MD 需要上传 .docx 文件")
+                        st.stop()
+
+                    working_md = convert_docx_to_md(content)
+
+                    if use_ai_1:
+                        with st.spinner("AI 正在优化排版..."):
+                            try:
+                                working_md = format_with_ai(
+                                    working_md, style, st.session_state.api_key
+                                )
+                                st.success("✅ AI 排版完成")
+                            except Exception as ai_err:
+                                st.warning(f"⚠️ AI 排版失败，将使用原始内容继续：{str(ai_err)[:200]}")
+
+                    final_md = working_md
+                    final_type = "md"
+
+                st.session_state.last_result_md = final_md
+                st.session_state.last_result_docx = final_docx
+                st.session_state.last_result_type = final_type
+
+                st.success(f"🎉 转换成功！")
+
+            except RuntimeError as e:
+                st.error(str(e))
+                st.info("💡 提示：请确保已安装 Pandoc。\n"
+                         "Windows: https://pandoc.org/installing.html\n"
+                         "Mac: brew install pandoc\n"
+                         "Linux: sudo apt install pandoc")
+                st.stop()
+            except Exception as e:
+                st.error(f"❌ 转换失败：{str(e)[:500]}")
+                st.stop()
+
+# ==================== Tab 2: DOCX 自动 AI 排版 ====================
+with tab_docx_auto:
+    st.markdown("**上传一份 Word 文档，AI 自动优化排版并生成格式规整的新 DOCX 文件。**")
+    st.info("💡 流程：上传 DOCX → 提取文本 → AI 智能排版（含封面+分页符）→ 生成精美 DOCX")
+
+    col_docx_up, col_docx_info = st.columns([1, 1])
+
+    with col_docx_up:
+        uploaded_docx = st.file_uploader(
+            f"上传需要排版的 .docx 文件（最大 {MAX_FILE_SIZE_MB}MB）",
+            type=["docx"],
+            help="上传 Word 文档，AI 将自动优化排版",
+            label_visibility="collapsed",
+            key="upload_docx_auto",
+        )
+
+    with col_docx_info:
+        if uploaded_docx is not None:
+            file_size_mb = uploaded_docx.size / (1024 * 1024)
+            st.metric("文件大小", f"{file_size_mb:.1f} MB")
+            st.metric("文件名", uploaded_docx.name)
+
+    # 排版风格选择
+    docx_style = st.radio(
+        "选择排版风格",
+        options=["docx_format", "general", "academic", "report"],
+        format_func=lambda x: {
+            "docx_format": "📋 智能识别（推荐）— 自动识别封面信息，最佳分页",
+            "general": "📝 通用 — 标题分级 + 分章分页",
+            "academic": "🎓 学术 — 严格格式 + 摘要/结论 + 分页",
+            "report": "📊 报告 — 目录 + 图表标注 + 分页",
+        }[x],
+        horizontal=False,
+        key="docx_style",
     )
 
-with col_text:
-    st.subheader("📝 文本粘贴")
-    text_input = st.text_area(
-        "粘贴 Markdown 文本（文件上传优先）",
-        height=200,
-        placeholder="在此粘贴 Markdown 内容...\n文件上传后将以文件内容为准",
-        label_visibility="collapsed",
-    )
-
-# ---- 转换选项 ----
-st.divider()
-col_dir, col_ai, col_btn = st.columns([1, 1, 1])
-
-with col_dir:
-    direction = st.radio(
-        "🔄 转换方向",
-        options=["md_to_docx", "docx_to_md"],
-        format_func=lambda x: "MD → Docx" if x == "md_to_docx" else "Docx → MD",
-        horizontal=True,
-    )
-
-with col_ai:
-    use_ai = st.checkbox(
-        "🤖 AI 优化排版",
-        value=False,
-        help="勾选后将调用 DeepSeek API 对内容进行智能排版优化",
-        disabled=not st.session_state.api_key.strip(),
-    )
-    if not st.session_state.api_key.strip():
-        st.caption("⚠️ 请先填写 API Key 以启用 AI 排版")
-
-with col_btn:
-    st.write("")  # 占位对齐
-    convert_clicked = st.button(
-        "🚀 开始转换",
+    auto_btn_clicked = st.button(
+        "🤖 开始 AI 排版",
         type="primary",
         use_container_width=True,
+        disabled=(uploaded_docx is None or not st.session_state.api_key.strip()),
+        key="btn_docx_auto",
     )
 
-st.divider()
+    if not st.session_state.api_key.strip():
+        st.caption("⚠️ 请先在侧边栏填写 DeepSeek API Key")
+    if uploaded_docx is None:
+        st.caption("⚠️ 请先上传需要排版的 .docx 文件")
 
-# ---- 核心转换逻辑 ----
-if convert_clicked:
-    # Step 1: 获取输入内容
-    content = None
-
-    if uploaded_file is not None:
-        # 检查文件大小
-        file_size_mb = uploaded_file.size / (1024 * 1024)
+    # ---- DOCX 自动排版逻辑 ----
+    if auto_btn_clicked and uploaded_docx is not None:
+        file_size_mb = uploaded_docx.size / (1024 * 1024)
         if file_size_mb > MAX_FILE_SIZE_MB:
             st.error(f"文件大小 {file_size_mb:.1f}MB 超过上限 {MAX_FILE_SIZE_MB}MB，请压缩后重试")
             st.stop()
 
-        # 根据扩展名判断文件类型
-        file_ext = uploaded_file.name.rsplit(".", 1)[-1].lower() if "." in uploaded_file.name else ""
-
-        if file_ext == "md":
-            content = _read_uploaded_file(uploaded_file)
-            if not content.strip():
-                st.error("上传的 Markdown 文件内容为空")
-                st.stop()
-        elif file_ext == "docx":
-            content = uploaded_file  # 传递文件对象给 docx 转换器
-        else:
-            st.error(f"不支持的文件格式：.{file_ext}，仅支持 {', '.join(SUPPORTED_EXTENSIONS)}")
-            st.stop()
-
-    elif text_input.strip():
-        content = text_input.strip()
-    else:
-        st.error("请上传文件或粘贴文本内容")
-        st.stop()
-
-    # Step 2: 执行转换
-    with st.spinner("正在处理..."):
-        final_md = ""
-        final_docx = None
-        final_type = ""
-
         try:
-            if direction == "md_to_docx":
-                # 确保 content 是文本字符串
-                if not isinstance(content, str):
-                    st.error("MD → Docx 需要 Markdown 文本输入，请上传 .md 文件或粘贴内容")
+            # Step 1: 提取文本
+            with st.spinner("📖 正在从 DOCX 提取文本内容..."):
+                extracted_md = _read_docx_as_text(uploaded_docx)
+                if not extracted_md.strip():
+                    st.error("无法从该文档中提取文字内容，请确认文件有效")
                     st.stop()
+                st.success(f"✅ 文本提取完成（{len(extracted_md)} 字符）")
 
-                working_md = content
+            # Step 2: AI 排版
+            with st.spinner(f"🤖 AI 正在优化排版（风格：{docx_style}）..."):
+                try:
+                    formatted_md = format_with_ai(
+                        extracted_md, docx_style, st.session_state.api_key
+                    )
+                    st.success(f"✅ AI 排版完成（{len(formatted_md)} 字符）")
+                except Exception as ai_err:
+                    st.warning(f"⚠️ AI 排版失败：{str(ai_err)[:300]}")
+                    st.info("将使用原始提取文本生成 DOCX")
+                    formatted_md = extracted_md
 
-                # AI 优化（若启用）
-                if use_ai:
-                    with st.spinner("AI 正在优化排版..."):
-                        try:
-                            working_md = format_with_ai(
-                                working_md, style, st.session_state.api_key
-                            )
-                            st.success("✅ AI 排版完成")
-                        except Exception as ai_err:
-                            st.warning(f"⚠️ AI 排版失败，将使用原始内容继续转换：{str(ai_err)[:200]}")
-
-                # MD → Docx
+            # Step 3: 生成 DOCX（含封面和分页符后处理）
+            with st.spinner("📄 正在生成格式化的 DOCX 文件..."):
                 final_docx = convert_md_to_docx(
-                    working_md, _get_template_path()
+                    formatted_md,
+                    _get_template_path(),
+                    enable_post_process=True,
                 )
-                final_md = working_md
-                final_type = "docx"
+                st.success("✅ DOCX 生成完成")
 
-            else:  # docx_to_md
-                # content 应该是文件对象（UploadedFile）或文件路径
-                if isinstance(content, str):
-                    st.error("Docx → MD 需要上传 .docx 文件")
-                    st.stop()
-
-                working_md = convert_docx_to_md(content)
-
-                # AI 优化（若启用）
-                if use_ai:
-                    with st.spinner("AI 正在优化排版..."):
-                        try:
-                            working_md = format_with_ai(
-                                working_md, style, st.session_state.api_key
-                            )
-                            st.success("✅ AI 排版完成")
-                        except Exception as ai_err:
-                            st.warning(f"⚠️ AI 排版失败，将使用原始内容继续：{str(ai_err)[:200]}")
-
-                final_md = working_md
-                final_type = "md"
-
-            # 保存结果到 session_state
-            st.session_state.last_result_md = final_md
+            # 保存结果
+            st.session_state.last_result_md = formatted_md
             st.session_state.last_result_docx = final_docx
-            st.session_state.last_result_type = final_type
-
-            st.success(f"🎉 转换成功！")
+            st.session_state.last_result_type = "docx"
 
         except RuntimeError as e:
             st.error(str(e))
@@ -304,10 +432,11 @@ if convert_clicked:
                      "Linux: sudo apt install pandoc")
             st.stop()
         except Exception as e:
-            st.error(f"❌ 转换失败：{str(e)[:500]}")
+            st.error(f"❌ 处理失败：{str(e)[:500]}")
             st.stop()
 
-# ---- 结果展示与下载 ----
+
+# ==================== 结果展示与下载（两个 Tab 共享） ====================
 if st.session_state.last_result_type:
     st.divider()
     st.subheader("📋 转换结果")
@@ -348,4 +477,4 @@ if st.session_state.last_result_type:
 
 # ==================== 页脚 ====================
 st.divider()
-st.caption("MD/Docx 智能互转排版系统 v1.0 | 使用 Pandoc + DeepSeek API 驱动")
+st.caption("MD/Docx 智能互转排版系统 v1.1 | 使用 Pandoc + DeepSeek API 驱动 | 封面排版·分页·DOCX 自动排版")
